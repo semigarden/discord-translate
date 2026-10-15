@@ -108,19 +108,33 @@ function formatTranslateError(status, detail) {
   return clean ? `${status}: ${clean.slice(0, 80)}` : String(status);
 }
 
+function decodeHtmlEntities(text) {
+  return String(text)
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;|&#0*39;|&#x0*27;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&amp;/gi, "&");
+}
+
 function parseTranslateResponse(data, source) {
   if (Array.isArray(data) && typeof data[0]?.[0] === "string") {
-    const text = data[0].filter((part) => typeof part === "string").join("");
+    const text = decodeHtmlEntities(data[0].filter((part) => typeof part === "string").join(""));
     if (text) {
       const detected = data[1]?.[0] || (source !== "auto" ? source : "unknown");
       return { text, detectedFrom: String(detected).toUpperCase() };
     }
   }
 
-  const translated = (data?.sentences || [])
-    .filter((s) => s && typeof s.trans === "string")
-    .map((s) => s.trans)
-    .join("");
+  const translated = decodeHtmlEntities(
+    (data?.sentences || [])
+      .filter((s) => s && typeof s.trans === "string")
+      .map((s) => s.trans)
+      .join("")
+  );
   if (translated) {
     const detected =
       data?.src ||
@@ -131,7 +145,7 @@ function parseTranslateResponse(data, source) {
 
   const chunks = data?.[0];
   if (Array.isArray(chunks) && chunks.length) {
-    const legacy = chunks.map((row) => row?.[0] ?? "").join("");
+    const legacy = decodeHtmlEntities(chunks.map((row) => row?.[0] ?? "").join(""));
     if (legacy) {
       const detected = data?.src || data?.[2] || (source !== "auto" ? source : "unknown");
       return { text: legacy, detectedFrom: String(detected).toUpperCase() };
@@ -209,13 +223,13 @@ async function translateText({ text, from, to }) {
   const key = cacheKey(text, source, target);
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) {
-    return { text: hit.text, detectedFrom: hit.detectedFrom };
+    return { text: decodeHtmlEntities(hit.text), detectedFrom: hit.detectedFrom };
   }
 
   return enqueue(async () => {
     const again = cache.get(key);
     if (again && Date.now() - again.at < CACHE_TTL_MS) {
-      return { text: again.text, detectedFrom: again.detectedFrom };
+      return { text: decodeHtmlEntities(again.text), detectedFrom: again.detectedFrom };
     }
 
     let lastError = "";
