@@ -1,3 +1,6 @@
+const PICKER_ROOT_SELECTOR =
+  "[class*='emojiPicker'], [class*='emoji-picker'], [class*='EmojiPicker'], [class*='gifPicker'], [class*='GifPicker'], [class*='expressionPicker'], [class*='ExpressionPicker'], [class*='stickerPicker'], [class*='StickerPicker'], [aria-label*='Emoji picker' i], [id*='emoji-picker']";
+
 function isDiscordTranslateUi(el) {
   return Boolean(
     el?.closest?.(
@@ -6,9 +9,14 @@ function isDiscordTranslateUi(el) {
   );
 }
 
+function isInsidePicker(el) {
+  return Boolean(el?.closest?.(PICKER_ROOT_SELECTOR));
+}
+
 function isComposerCandidate(el) {
   if (!(el instanceof HTMLElement)) return false;
   if (isDiscordTranslateUi(el)) return false;
+  if (isInsidePicker(el)) return false;
   if (el.getAttribute("aria-disabled") === "true") return false;
   if (el.tagName === "TEXTAREA") return true;
   if (el.tagName === "INPUT" && /^(text|search)$/i.test(el.type || "text")) return true;
@@ -37,15 +45,29 @@ function composerScore(el) {
 
 function getComposer() {
   const active = document.activeElement;
-  if (isComposerCandidate(active)) return active;
-  if (active instanceof Element) {
+  if (isComposerCandidate(active) && active.closest?.('[class*="channelTextArea"], [class*="slateContainer"], form')) {
+    return active;
+  }
+  if (active instanceof Element && !isInsidePicker(active)) {
     const wrap = active.closest(
       '[contenteditable], [data-slate-editor="true"], [data-slate-node="value"], [role="textbox"], textarea'
     );
-    if (isComposerCandidate(wrap)) return wrap;
+    if (
+      isComposerCandidate(wrap) &&
+      wrap.closest?.('[class*="channelTextArea"], [class*="slateContainer"], form')
+    ) {
+      return wrap;
+    }
   }
 
   const selectors = [
+    '[class*="channelTextArea"] [data-slate-editor="true"]',
+    '[class*="channelTextArea"] [data-slate-node="value"]',
+    '[class*="channelTextArea"] [contenteditable="true"]',
+    '[class*="channelTextArea"] [contenteditable="plaintext-only"]',
+    '[class*="channelTextArea"] [contenteditable]',
+    '[class*="channelTextArea"] [role="textbox"]',
+    '[class*="channelTextArea"] textarea',
     '[data-slate-editor="true"]',
     '[data-slate-node="value"]',
     '[contenteditable="true"]',
@@ -54,8 +76,6 @@ function getComposer() {
     '[role="textbox"]',
     "textarea",
     '[class*="slateTextArea"]',
-    '[class*="channelTextArea"] [contenteditable]',
-    '[class*="channelTextArea"] [role="textbox"]',
     "main [contenteditable]",
     "form [contenteditable]",
   ];
@@ -82,6 +102,43 @@ function getComposerRoot(composer) {
   );
 }
 
+function isComposerEmojiImage(img) {
+  if (!(img instanceof HTMLImageElement)) return false;
+  if (img.closest?.('[aria-hidden="true"], [class*="hiddenVisually"]')) return false;
+  const cls = typeof img.className === "string" ? img.className : String(img.className || "");
+  if (/emoji/i.test(cls)) return true;
+  if ((img.getAttribute("data-type") || "").toLowerCase() === "emoji") return true;
+  const src = img.currentSrc || img.src || "";
+  if (/discord(?:app)?\.com\/emojis\//i.test(src)) return true;
+  const alt = img.alt || "";
+  if (/^:[\w~+-]+:$/.test(alt)) return true;
+  return false;
+}
+
+function composerEmojiPlain(img) {
+  const alt = (img.getAttribute("alt") || "").trim();
+  const aria = (img.getAttribute("aria-label") || "").trim();
+  const glyph = [alt, aria].find((v) => v && !/^:[\w~+-]+:$/.test(v));
+  if (glyph) return glyph;
+
+  const short = (alt || aria).match(/^:([\w~+-]+):$/);
+  const src = img.currentSrc || img.src || "";
+  const id = src.match(/\/emojis\/(\d+)/)?.[1];
+  if (short && id) {
+    const animated = /\.gif(?:\?|$)/i.test(src);
+    return animated ? `<a:${short[1]}:${id}>` : `<:${short[1]}:${id}>`;
+  }
+  return alt || aria || "";
+}
+
+function normalizeComposerText(raw) {
+  return String(raw || "")
+    .replace(/[\u200b\u200c\u200d\ufeff]/g, "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\n+$/g, "")
+    .trim();
+}
+
 function getComposerText(composer) {
   if (!composer) return "";
 
@@ -89,43 +146,55 @@ function getComposerText(composer) {
     return (composer.value || "").trim();
   }
 
-  const slateParts = [];
-  for (const node of composer.querySelectorAll("[data-slate-string]")) {
-    slateParts.push(node.textContent || "");
-  }
-  let raw = slateParts.join("");
+  const parts = [];
+  const walker = document.createTreeWalker(composer, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
 
-  if (!raw.replace(/[\u200b\u200c\u200d\ufeff]/g, "").trim()) {
+  let node;
+  while ((node = walker.nextNode())) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const parent = node.parentElement;
+      if (!parent?.closest?.("[data-slate-string]")) continue;
+      if (parent.closest?.("img")) continue;
+      parts.push(node.nodeValue || "");
+      continue;
+    }
+    if (node instanceof HTMLImageElement && isComposerEmojiImage(node)) {
+      const plain = composerEmojiPlain(node);
+      if (plain) parts.push(plain);
+    }
+  }
+
+  let raw = parts.join("");
+  if (!normalizeComposerText(raw)) {
     raw = composer.innerText || composer.textContent || "";
   }
 
-  return raw
-    .replace(/[\u200b\u200c\u200d\ufeff]/g, "")
-    .replace(/\u00a0/g, " ")
-    .replace(/\n+$/g, "")
-    .trim();
+  return normalizeComposerText(raw);
 }
 
-function setComposerText(composer, text) {
-  if (!composer) return;
-
-  if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
-    composer.value = text;
-    composer.dispatchEvent(new Event("input", { bubbles: true }));
-    return;
-  }
-
+function selectComposerContents(composer) {
   composer.focus();
   const selection = window.getSelection();
   const range = document.createRange();
   range.selectNodeContents(composer);
   selection.removeAllRanges();
   selection.addRange(range);
-  if (!document.execCommand("insertText", false, text)) {
-    composer.textContent = text;
+}
+
+function setComposerText(composer, text) {
+  if (!composer) return;
+  const plain = String(text ?? "");
+
+  if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+    composer.value = plain;
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    return;
   }
+
+  selectComposerContents(composer);
+  document.execCommand("insertText", false, plain);
   composer.dispatchEvent(
-    new InputEvent("input", { bubbles: true, inputType: "insertText", data: text })
+    new InputEvent("input", { bubbles: true, inputType: "insertText", data: plain })
   );
 }
 
@@ -263,6 +332,10 @@ function startComposerController(getSettingsSnapshot) {
     draftState = { original: "", translated: "", showingTranslated: false };
   }
 
+  function isDraftBusy() {
+    return Boolean(getDraftTranslateButton()?.classList.contains("discord-translate-btn--busy"));
+  }
+
   function resetDraftUi(composer) {
     clearDraftTranslationState(composer);
     resetDraftState();
@@ -306,6 +379,8 @@ function startComposerController(getSettingsSnapshot) {
       return;
     }
 
+    if (isDraftBusy()) return;
+
     const draft = getComposerText(composer);
     if (!draft || draft.startsWith("/")) return;
 
@@ -313,37 +388,37 @@ function startComposerController(getSettingsSnapshot) {
     draftState.translated = "";
     draftState.showingTranslated = false;
     composer.dataset.discordTranslateOriginalDraft = draft;
-    setComposerText(composer, "…");
     setDiscordTranslateIconButton(getDraftTranslateButton(), "Translating…", { busy: true });
 
     const serial = ++requestSerial;
 
     try {
       const result = await translateText(draft, settings.outgoing, "auto");
-      if (serial !== requestSerial) return;
+      const live = getComposer() || composer;
+      if (serial !== requestSerial) {
+        syncDraftUi();
+        return;
+      }
 
       if (translationUnchanged(result, draft, settings.outgoing)) {
-        setComposerText(composer, draft);
-        clearDraftTranslationState(composer);
+        clearDraftTranslationState(live);
         resetDraftState();
         syncDraftUi();
         return;
       }
 
-      const current = getComposerText(composer);
+      const current = getComposerText(live);
       if (!current || current.startsWith("/")) {
-        setComposerText(composer, draft);
-        clearDraftTranslationState(composer);
+        clearDraftTranslationState(live);
         resetDraftState();
         syncDraftUi();
         return;
       }
 
       if (!result.text) {
-        setComposerText(composer, draft);
-        clearDraftTranslationState(composer);
+        clearDraftTranslationState(live);
         resetDraftState();
-        composer.classList.add("discord-translate-inline-error");
+        live.classList.add("discord-translate-inline-error");
         syncDraftUi();
         return;
       }
@@ -351,54 +426,155 @@ function startComposerController(getSettingsSnapshot) {
       draftState.original = draft;
       draftState.translated = result.text;
       draftState.showingTranslated = true;
-      composer.dataset.discordTranslateOriginalDraft = draft;
-      composer.dataset.discordTranslateTranslatedDraft = result.text;
-      composer.dataset.discordTranslateDraftTranslated = "1";
-      setComposerText(composer, result.text);
+      live.dataset.discordTranslateOriginalDraft = draft;
+      live.dataset.discordTranslateTranslatedDraft = result.text;
+      live.dataset.discordTranslateDraftTranslated = "1";
+      setComposerText(live, result.text);
       lastComposerText = result.text;
       syncDraftUi();
     } catch (err) {
-      if (serial !== requestSerial) return;
-      setComposerText(composer, draft);
-      clearDraftTranslationState(composer);
+      if (serial !== requestSerial) {
+        syncDraftUi();
+        return;
+      }
+      const live = getComposer() || composer;
+      clearDraftTranslationState(live);
       resetDraftState();
-      composer.classList.add("discord-translate-inline-error");
+      live.classList.add("discord-translate-inline-error");
       syncDraftUi();
       console.warn("[Discord Translate] draft translate failed:", err);
     }
   }
 
+  let syncTimer = 0;
+  let syncing = false;
+  let lastPlacedComposer = null;
+
+  function draftButtonIsCorrectlyPlaced(composer) {
+    const wrap = getDraftTranslateWrap();
+    if (!wrap?.isConnected || !composer) return false;
+    const root = getComposerRoot(composer);
+    if (!root?.contains(wrap)) return false;
+    const buttons = findComposerButtonsContainer(root);
+    if (buttons) return buttons.contains(wrap);
+    return true;
+  }
+
   function syncDraftUi() {
-    const settings = getSettingsSnapshot();
-    const composer = getComposer();
+    if (syncing) return;
+    syncing = true;
+    try {
+      const settings = getSettingsSnapshot();
+      const composer = getComposer();
 
-    if (!settings?.enabled) {
-      removeDraftButton();
-      clearDraftTranslationState(composer);
-      resetDraftState();
-      return;
+      if (!settings?.enabled) {
+        removeDraftButton();
+        clearDraftTranslationState(composer);
+        resetDraftState();
+        lastPlacedComposer = null;
+        return;
+      }
+
+      if (!composer) {
+        if (isInsidePicker(document.activeElement) && getDraftTranslateWrap()?.isConnected) {
+          return;
+        }
+        removeDraftButton();
+        lastPlacedComposer = null;
+        return;
+      }
+
+      ensureDraftTranslateButton(translateDraft);
+      lastPlacedComposer = composer;
+      syncDraftButtonLabel(draftState.showingTranslated);
+      maybeResetWhenEmpty(composer);
+    } finally {
+      syncing = false;
+    }
+  }
+
+  function scheduleDraftSync(delayMs = 200) {
+    if (syncing) return;
+    if (syncTimer) window.clearTimeout(syncTimer);
+    syncTimer = window.setTimeout(() => {
+      syncTimer = 0;
+      syncDraftUi();
+    }, delayMs);
+  }
+
+  function mutationAffectsComposerArea(mutation) {
+    if (mutation.type !== "childList") return false;
+
+    for (const node of mutation.removedNodes) {
+      if (!(node instanceof Element)) continue;
+      if (
+        node.classList?.contains("discord-translate-draft-translate-wrap") ||
+        node.querySelector?.(".discord-translate-draft-translate-wrap, .discord-translate-draft-translate-btn")
+      ) {
+        return true;
+      }
     }
 
-    if (!composer) {
-      removeDraftButton();
-      return;
+    if (!mutation.addedNodes.length) return false;
+    for (const node of mutation.addedNodes) {
+      if (!(node instanceof Element)) continue;
+      if (isDiscordTranslateUi(node)) continue;
+      if (isInsidePicker(node)) continue;
+      if (
+        node.matches?.(
+          '[contenteditable], [data-slate-editor], [role="textbox"], textarea, [class*="channelTextArea"], [class*="slateContainer"], [class*="buttons_"], [class*="buttons-"], [class*="buttonContainer"], form'
+        ) ||
+        node.querySelector?.(
+          '[contenteditable], [data-slate-editor], [role="textbox"], textarea, [class*="channelTextArea"], [class*="buttons_"], [class*="buttons-"]'
+        )
+      ) {
+        return true;
+      }
     }
 
-    ensureDraftTranslateButton(translateDraft);
-    syncDraftButtonLabel(draftState.showingTranslated);
+    const t = mutation.target;
+    if (
+      t instanceof Element &&
+      t.closest?.('[class*="channelTextArea"], [class*="slateContainer"], [class*="form_"], form') &&
+      !t.closest?.(
+        `${PICKER_ROOT_SELECTOR}, [id^='chat-messages-'], [data-list-id='chat-messages']`
+      )
+    ) {
+      return true;
+    }
+    return false;
   }
 
   syncDraftUi();
 
-  const inputObserver = new MutationObserver(() => {
-    maybeResetWhenEmpty(getComposer());
-    syncDraftUi();
+  const inputObserver = new MutationObserver((mutations) => {
+    if (syncing) return;
+    for (const mutation of mutations) {
+      if (!mutationAffectsComposerArea(mutation)) continue;
+      const dropped = [...mutation.removedNodes].some(
+        (n) =>
+          n instanceof Element &&
+          (n.classList?.contains("discord-translate-draft-translate-wrap") ||
+            n.querySelector?.(".discord-translate-draft-translate-wrap"))
+      );
+      scheduleDraftSync(dropped ? 50 : mutations.length > 40 ? 600 : 200);
+      return;
+    }
   });
   inputObserver.observe(document.body || document.documentElement, {
     childList: true,
     subtree: true,
-    characterData: true,
   });
+
+  function onComposerInput(event) {
+    const t = event.target;
+    if (!(t instanceof Element) || isInsidePicker(t)) return;
+    if (!isComposerCandidate(t) && !t.closest?.('[contenteditable], [role="textbox"], textarea')) {
+      return;
+    }
+    maybeResetWhenEmpty(getComposer());
+  }
+  document.addEventListener("input", onComposerInput, true);
 
   function onComposerKeyDown(event) {
     if (event.key !== "Enter" || event.shiftKey) return;
@@ -411,15 +587,37 @@ function startComposerController(getSettingsSnapshot) {
   document.addEventListener("keydown", onComposerKeyDown, true);
 
   function onComposerClick(event) {
-    if (!draftState.showingTranslated) return;
     const target = event.target instanceof Element ? event.target : null;
-    const btn = target?.closest('[role="button"], button');
+    if (!target || isDiscordTranslateUi(target)) return;
+
+    const label = (target.closest?.("[aria-label]")?.getAttribute("aria-label") || "").toLowerCase();
+    if (
+      /emoji|gif|sticker|apps|express/.test(label) &&
+      target.closest?.('[class*="channelTextArea"], [class*="buttons_"], [class*="buttons-"], form')
+    ) {
+      scheduleDraftSync(50);
+      window.setTimeout(() => {
+        if (!draftButtonIsCorrectlyPlaced(getComposer())) scheduleDraftSync(0);
+      }, 350);
+    }
+
+    if (!draftState.showingTranslated) return;
+    const btn = target.closest('[role="button"], button');
     if (!btn || !isSendButton(btn)) return;
     const composer = getComposer();
     if (!composer || !getComposerRoot(composer)?.contains(btn)) return;
     scheduleResetAfterSend();
   }
   document.addEventListener("click", onComposerClick, true);
+
+  function onFocusIn(event) {
+    if (isInsidePicker(event.target)) {
+      if (!draftButtonIsCorrectlyPlaced(getComposer())) scheduleDraftSync(50);
+      return;
+    }
+    scheduleDraftSync(100);
+  }
+  document.addEventListener("focusin", onFocusIn, true);
 
   function onSettingsChanged() {
     requestSerial += 1;
@@ -430,8 +628,11 @@ function startComposerController(getSettingsSnapshot) {
     clearDraftTranslationState(composer);
     resetDraftState();
     removeDraftButton();
+    lastPlacedComposer = null;
     syncDraftUi();
   }
+
+  window.setInterval(() => scheduleDraftSync(0), 15_000);
 
   return { onSettingsChanged };
 }

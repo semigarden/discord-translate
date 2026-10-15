@@ -120,16 +120,31 @@ function decodeHtmlEntities(text) {
     .replace(/&amp;/gi, "&");
 }
 
+function protectEmojiPlaceholders(text) {
+  return String(text).replace(/⟦(\d+)⟧/g, '<span translate="no">⟦$1⟧</span>');
+}
+
+function restoreEmojiPlaceholders(text) {
+  return decodeHtmlEntities(text)
+    .replace(/<span[^>]*>\s*⟦\s*(\d+)\s*⟧\s*<\/span>/gi, "⟦$1⟧")
+    .replace(/⟦\s*(\d+)\s*⟧/g, "⟦$1⟧")
+    .replace(/<\/?span[^>]*>/gi, "");
+}
+
+function normalizeTranslatedText(text) {
+  return restoreEmojiPlaceholders(text);
+}
+
 function parseTranslateResponse(data, source) {
   if (Array.isArray(data) && typeof data[0]?.[0] === "string") {
-    const text = decodeHtmlEntities(data[0].filter((part) => typeof part === "string").join(""));
+    const text = normalizeTranslatedText(data[0].filter((part) => typeof part === "string").join(""));
     if (text) {
       const detected = data[1]?.[0] || (source !== "auto" ? source : "unknown");
       return { text, detectedFrom: String(detected).toUpperCase() };
     }
   }
 
-  const translated = decodeHtmlEntities(
+  const translated = normalizeTranslatedText(
     (data?.sentences || [])
       .filter((s) => s && typeof s.trans === "string")
       .map((s) => s.trans)
@@ -145,7 +160,7 @@ function parseTranslateResponse(data, source) {
 
   const chunks = data?.[0];
   if (Array.isArray(chunks) && chunks.length) {
-    const legacy = decodeHtmlEntities(chunks.map((row) => row?.[0] ?? "").join(""));
+    const legacy = normalizeTranslatedText(chunks.map((row) => row?.[0] ?? "").join(""));
     if (legacy) {
       const detected = data?.src || data?.[2] || (source !== "auto" ? source : "unknown");
       return { text: legacy, detectedFrom: String(detected).toUpperCase() };
@@ -177,7 +192,7 @@ async function translateViaPa(sl, tl, q) {
       "Content-Type": "application/json+protobuf",
       "X-Goog-API-Key": TRANSLATE_PA_KEY,
     },
-    body: JSON.stringify([[[q], sl, tl], "wt_lib"]),
+    body: JSON.stringify([[[protectEmojiPlaceholders(q)], sl, tl], "wt_lib"]),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
@@ -223,13 +238,13 @@ async function translateText({ text, from, to }) {
   const key = cacheKey(text, source, target);
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) {
-    return { text: decodeHtmlEntities(hit.text), detectedFrom: hit.detectedFrom };
+    return { text: normalizeTranslatedText(hit.text), detectedFrom: hit.detectedFrom };
   }
 
   return enqueue(async () => {
     const again = cache.get(key);
     if (again && Date.now() - again.at < CACHE_TTL_MS) {
-      return { text: decodeHtmlEntities(again.text), detectedFrom: again.detectedFrom };
+      return { text: normalizeTranslatedText(again.text), detectedFrom: again.detectedFrom };
     }
 
     let lastError = "";

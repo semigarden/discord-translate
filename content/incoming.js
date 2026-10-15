@@ -134,7 +134,11 @@ function messageHasCachedTranslation(messageEl) {
 function rememberTranslation(messageEl, src, dst) {
   if (!src || !dst) return;
   for (const key of collectMessageKeys(messageEl)) {
-    getStateRecordByKey(key).cache.set(src, dst);
+    const cache = getStateRecordByKey(key).cache;
+    cache.set(src, dst);
+    while (cache.size > 24) {
+      cache.delete(cache.keys().next().value);
+    }
   }
 }
 
@@ -189,15 +193,44 @@ function findLiveMessageEl(messageEl) {
   return messageEl;
 }
 
-function extractMessageText(contentEl) {
-  if (!contentEl) return "";
+function isDiscordEmojiImage(img) {
+  if (!(img instanceof HTMLImageElement)) return false;
+  const cls = typeof img.className === "string" ? img.className : String(img.className || "");
+  if (/emoji/i.test(cls)) return true;
+  if ((img.getAttribute("data-type") || "").toLowerCase() === "emoji") return true;
+  const src = img.currentSrc || img.src || "";
+  if (/discord(?:app)?\.com\/emojis\//i.test(src)) return true;
+  const alt = img.alt || "";
+  if (/^:[\w~+-]+:$/.test(alt)) return true;
+  return false;
+}
+
+function collectEmojiImages(root) {
+  if (!root) return [];
+  return [...root.querySelectorAll("img")].filter(isDiscordEmojiImage);
+}
+
+function emojiPlaceholder(index) {
+  return `⟦${index}⟧`;
+}
+
+function prepareContentClone(contentEl, { reply = false } = {}) {
+  if (!contentEl) return null;
   const clone = contentEl.cloneNode(true);
   clone.classList.remove("discord-translate-content-suppressed");
-  clone
-    .querySelectorAll(
-      ".discord-translate-translate-btn, .discord-translate-translate-wrap, .discord-translate-inline-translation"
-    )
-    .forEach((n) => n.remove());
+  const removeSel = reply
+    ? ".discord-translate-inline-translation, [class*='timestamp'], [class*='hiddenVisually'], time"
+    : ".discord-translate-translate-btn, .discord-translate-translate-wrap, .discord-translate-inline-translation";
+  clone.querySelectorAll(removeSel).forEach((n) => n.remove());
+  collectEmojiImages(clone).forEach((img, i) => {
+    img.replaceWith(document.createTextNode(emojiPlaceholder(i)));
+  });
+  return clone;
+}
+
+function extractMessageText(contentEl) {
+  const clone = prepareContentClone(contentEl);
+  if (!clone) return "";
   return (clone.innerText || clone.textContent || "").trim();
 }
 
@@ -296,23 +329,47 @@ function getReplyMessageSpan(textEl) {
     if (span.matches?.('[class*="timestamp"], [class*="hiddenVisually"]')) continue;
     if (span.querySelector?.("time")) continue;
     const text = (span.textContent || "").trim();
-    if (text) return span;
+    if (text || collectEmojiImages(span).length) return span;
   }
   return null;
 }
 
 function extractReplyText(contentEl) {
-  if (!contentEl) return "";
-  const clone = contentEl.cloneNode(true);
-  clone.classList.remove("discord-translate-content-suppressed");
-  clone
-    .querySelectorAll(
-      ".discord-translate-inline-translation, [class*='timestamp'], [class*='hiddenVisually'], time"
-    )
-    .forEach((n) => n.remove());
+  const clone = prepareContentClone(contentEl, { reply: true });
+  if (!clone) return "";
   const messageSpan = getReplyMessageSpan(clone);
-  if (messageSpan) return (messageSpan.textContent || "").trim();
-  return (clone.textContent || clone.innerText || "").trim();
+  if (messageSpan) return (messageSpan.innerText || messageSpan.textContent || "").trim();
+  return (clone.innerText || clone.textContent || "").trim();
+}
+
+function renderTranslatedOverlay(overlay, translatedText, sourceEl) {
+  const emojis = collectEmojiImages(sourceEl);
+  const frag = document.createDocumentFragment();
+  const re = /⟦(\d+)⟧/g;
+  let lastIndex = 0;
+  let match;
+  let restored = 0;
+  while ((match = re.exec(translatedText))) {
+    if (match.index > lastIndex) {
+      frag.append(translatedText.slice(lastIndex, match.index));
+    }
+    const emoji = emojis[Number(match[1])];
+    if (emoji) {
+      frag.append(emoji.cloneNode(true));
+      restored += 1;
+    } else {
+      frag.append(match[0]);
+    }
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < translatedText.length) {
+    frag.append(translatedText.slice(lastIndex));
+  }
+  if (emojis.length && restored === 0 && !/⟦\d+⟧/.test(translatedText)) {
+    if (translatedText) frag.append(" ");
+    for (const emoji of emojis) frag.append(emoji.cloneNode(true));
+  }
+  overlay.replaceChildren(frag);
 }
 
 function extractTargetText(contentEl) {
@@ -390,6 +447,17 @@ function applyInlineText(contentEl, text) {
     (isReplyPreviewContent(contentEl) ? contentEl : contentEl);
 
   const tid = ensureContentTargetId(hideEl);
+  let overlay = findTranslationOverlay(hideEl);
+  if (
+    overlay &&
+    overlay.isConnected &&
+    overlay.dataset.discordTranslateBody === text &&
+    hideEl.hidden &&
+    hideEl.classList.contains("discord-translate-content-suppressed")
+  ) {
+    return;
+  }
+
   hideEl.setAttribute(TRANSLATED, "1");
   hideEl.setAttribute(ORIGINAL_HTML, "1");
   hideEl.classList.add("discord-translate-content-suppressed");
@@ -403,7 +471,7 @@ function applyInlineText(contentEl, text) {
     sibling = next;
   }
 
-  let overlay = findTranslationOverlay(hideEl);
+  overlay = findTranslationOverlay(hideEl);
   if (!overlay) {
     overlay = document.createElement(hideEl.tagName || "div");
     overlay.className = `${hideEl.className} discord-translate-inline-translation`.replace(
@@ -424,11 +492,10 @@ function applyInlineText(contentEl, text) {
     hideEl.removeAttribute(TRANSLATED);
     return;
   }
-  overlay.textContent = text;
-}
-
-function showLoadingInline(contentEl) {
-  applyInlineText(contentEl, "…");
+  if (overlay.dataset.discordTranslateBody !== text) {
+    overlay.dataset.discordTranslateBody = text;
+    renderTranslatedOverlay(overlay, text, hideEl);
+  }
 }
 
 function restoreOriginal(contentEl) {
@@ -657,7 +724,7 @@ async function processIncomingMessage(
   messageEl,
   settings,
   getSettingsSnapshot,
-  { showLoading = false } = {}
+  { revealErrors = false } = {}
 ) {
   if (!settings.enabled) return;
 
@@ -672,15 +739,6 @@ async function processIncomingMessage(
   if (!hasText) return;
 
   messageEl.setAttribute(DISCORD_TRANSLATE_ATTR.PROCESSED, `pending:${key}`);
-
-  if (showLoading) {
-    for (const target of targets) {
-      const text = extractTargetText(target.el);
-      if (!getCachedTranslation(target.el, text) && !getMemoryCachedTranslation(messageEl, text)) {
-        showLoadingInline(target.el);
-      }
-    }
-  }
 
   let rateLimited = false;
   let lastError = "";
@@ -722,7 +780,7 @@ async function processIncomingMessage(
   if (lastError && !translated) {
     restoreMessage(messageEl);
     setViewState(messageEl, "original");
-    if (showLoading) {
+    if (revealErrors) {
       const main = findMessageContent(messageEl) || targets[0]?.el;
       if (main) {
         applyInlineText(main, `Translation error: ${lastError}`);
@@ -783,7 +841,7 @@ async function handleTranslateClick(messageEl, getSettingsSnapshot) {
   }
 
   setTranslateButtonLabel(messageEl, "busy", settings);
-  await processIncomingMessage(messageEl, settings, getSettingsSnapshot, { showLoading: true });
+  await processIncomingMessage(messageEl, settings, getSettingsSnapshot, { revealErrors: true });
 }
 
 function isPendingFor(messageEl, key) {
@@ -853,35 +911,120 @@ function collectMessageElements() {
   return [...map.values()];
 }
 
-function startMessageObserver(getSettingsSnapshot) {
-  let scanTimer = 0;
+const MESSAGE_STATE_MAX = 400;
+const OUR_UI_SELECTOR =
+  ".discord-translate-translate-wrap, .discord-translate-inline-translation, .discord-translate-draft-translate-wrap, .discord-translate-tooltip, .discord-translate-content-suppressed";
+const IGNORED_OVERLAY_SELECTOR =
+  "[class*='emojiPicker'], [class*='emoji-picker'], [class*='EmojiPicker'], [class*='gifPicker'], [class*='GifPicker'], [class*='expressionPicker'], [class*='ExpressionPicker'], [class*='stickers'], [aria-label*='Emoji picker' i], [id*='emoji-picker']";
 
-  function syncMessages() {
-    const settings = getSettingsSnapshot();
-    if (!settings?.enabled) {
-      removeTranslateButtons();
-      return;
-    }
+function isOurTranslateNode(node) {
+  if (!node) return false;
+  const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  if (!el?.closest) return false;
+  if (el.closest(OUR_UI_SELECTOR)) return true;
+  if (el.classList?.contains("discord-translate-inline-translation")) return true;
+  return Boolean(el.dataset?.discordTranslateFor || el.dataset?.discordTranslateTargetId);
+}
 
-    for (const el of collectMessageElements()) {
-      ensureTranslateButton(el, getSettingsSnapshot);
+function isIgnoredOverlayNode(node) {
+  if (!node) return false;
+  const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  return Boolean(el?.closest?.(IGNORED_OVERLAY_SELECTOR));
+}
+
+function mutationAddsChatContent(mutation) {
+  if (mutation.type !== "childList") return false;
+
+  for (const node of mutation.removedNodes) {
+    if (!(node instanceof Element)) continue;
+    if (
+      node.classList?.contains("discord-translate-translate-wrap") ||
+      node.querySelector?.(".discord-translate-translate-wrap, .discord-translate-translate-btn")
+    ) {
+      return true;
     }
   }
 
-  function scheduleSync() {
-    if (scanTimer) return;
+  if (!mutation.addedNodes.length) return false;
+  for (const node of mutation.addedNodes) {
+    if (!(node instanceof Element)) continue;
+    if (isOurTranslateNode(node) || isIgnoredOverlayNode(node)) continue;
+    if (
+      node.id?.startsWith("chat-messages-") ||
+      node.id?.startsWith("message-content-") ||
+      node.getAttribute?.("data-list-item-id")?.includes("chat-messages") ||
+      node.matches?.(
+        '[class*="messageListItem"], [class*="message_"], [class*="reactions"], [id^="chat-messages-"], [id^="message-content-"]'
+      )
+    ) {
+      return true;
+    }
+    if (
+      node.querySelector?.(
+        '[id^="chat-messages-"], [id^="message-content-"], [data-list-item-id*="chat-messages"], [class*="messageListItem"], [class*="reactions"]'
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function pruneMessageViewState(liveKeys) {
+  if (messageViewState.size <= MESSAGE_STATE_MAX) return;
+  for (const key of messageViewState.keys()) {
+    if (messageViewState.size <= MESSAGE_STATE_MAX) break;
+    if (liveKeys.has(key)) continue;
+    messageViewState.delete(key);
+  }
+}
+
+function startMessageObserver(getSettingsSnapshot) {
+  let scanTimer = 0;
+  let syncing = false;
+
+  function syncMessages() {
+    if (syncing) return;
+    syncing = true;
+    try {
+      const settings = getSettingsSnapshot();
+      if (!settings?.enabled) {
+        removeTranslateButtons();
+        return;
+      }
+
+      const liveKeys = new Set();
+      for (const el of collectMessageElements()) {
+        for (const key of collectMessageKeys(el)) liveKeys.add(key);
+        ensureTranslateButton(el, getSettingsSnapshot);
+      }
+      pruneMessageViewState(liveKeys);
+    } finally {
+      syncing = false;
+    }
+  }
+
+  function scheduleSync(delayMs = 250) {
+    if (syncing) return;
+    if (scanTimer) window.clearTimeout(scanTimer);
     scanTimer = window.setTimeout(() => {
       scanTimer = 0;
       syncMessages();
-    }, 200);
+    }, delayMs);
   }
 
   const mutationObserver = new MutationObserver((mutations) => {
+    if (syncing) return;
     for (const mutation of mutations) {
-      if (mutation.type === "childList" && mutation.addedNodes.length) {
-        scheduleSync();
-        return;
-      }
+      if (!mutationAddsChatContent(mutation)) continue;
+      const dropped = [...mutation.removedNodes].some(
+        (n) =>
+          n instanceof Element &&
+          (n.classList?.contains("discord-translate-translate-wrap") ||
+            n.querySelector?.(".discord-translate-translate-wrap"))
+      );
+      scheduleSync(dropped ? 50 : mutations.length > 40 ? 500 : 250);
+      return;
     }
   });
 
@@ -891,7 +1034,7 @@ function startMessageObserver(getSettingsSnapshot) {
     subtree: true,
   });
 
-  window.setInterval(syncMessages, 3000);
+  window.setInterval(() => scheduleSync(0), 12_000);
   syncMessages();
 }
 
